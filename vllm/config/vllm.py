@@ -565,6 +565,29 @@ class VllmConfig:
         # This is the same for all backends
         self.kv_transfer_config.kv_role = "kv_both"
 
+    def _use_validated_mamba_prefix_async_default(self) -> bool:
+        """Allow async scheduling for the validated 1Cat Qwen3.5 AWQ path."""
+        if self.model_config is None:
+            return False
+        if self.cache_config.mamba_cache_mode != "align":
+            return False
+
+        text_config = self.model_config.hf_text_config
+        model_type = getattr(text_config, "model_type", "")
+        if model_type not in (
+            "qwen3_5",
+            "qwen3_5_text",
+            "qwen3_5_moe",
+            "qwen3_5_moe_text",
+        ):
+            return False
+
+        quantization = str(getattr(self.model_config, "quantization", "") or "")
+        if not quantization.lower().startswith("awq"):
+            return False
+
+        return True
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -594,6 +617,10 @@ class VllmConfig:
             "uni",
             "external_launcher",
         )
+        enable_mamba_prefix_async = (
+            envs.VLLM_ENABLE_MAMBA_PREFIX_ASYNC
+            or self._use_validated_mamba_prefix_async_default()
+        )
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
@@ -618,7 +645,7 @@ class VllmConfig:
                 )
             if (
                 self.cache_config.mamba_cache_mode != "none"
-                and not envs.VLLM_ENABLE_MAMBA_PREFIX_ASYNC
+                and not enable_mamba_prefix_async
             ):
                 raise ValueError(
                     "Currently, async scheduling is not compatible with "
@@ -626,7 +653,7 @@ class VllmConfig:
                 )
             if (
                 self.cache_config.mamba_cache_mode != "none"
-                and envs.VLLM_ENABLE_MAMBA_PREFIX_ASYNC
+                and enable_mamba_prefix_async
             ):
                 logger.warning_once(
                     "Experimental Mamba prefix caching + async scheduling is "
@@ -667,7 +694,7 @@ class VllmConfig:
                 self.scheduler_config.async_scheduling = False
             elif (
                 self.cache_config.mamba_cache_mode != "none"
-                and not envs.VLLM_ENABLE_MAMBA_PREFIX_ASYNC
+                and not enable_mamba_prefix_async
             ):
                 logger.warning_once(
                     "Async scheduling is not compatible with "

@@ -37,6 +37,7 @@ from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
@@ -468,6 +469,18 @@ class SpecDecodeBaseProposer:
         sampling_metadata: SamplingMetadata,
         logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if (
+            self.method == "mtp"
+            and not sampling_metadata.all_greedy
+            and _mtp_token_matching_sampling_enabled(sampling_metadata)
+        ):
+            if logits is not None:
+                return logits.argmax(dim=-1), None
+            return self._greedy_sample(hidden_states), None
+        if self.method == "mtp" and not sampling_metadata.all_greedy:
+            if logits is None:
+                logits = self.model.compute_logits(hidden_states)
+            return self._sample_from_logits(logits, sampling_metadata)
         if logits is not None:
             return logits.argmax(dim=-1), None
         return self._greedy_sample(hidden_states), None
@@ -755,6 +768,8 @@ class SpecDecodeBaseProposer:
                 common_attn_metadata._seq_lens_cpu += 1
             if common_attn_metadata._num_computed_tokens_cpu is not None:
                 common_attn_metadata._num_computed_tokens_cpu += 1
+            if getattr(common_attn_metadata, "seq_lens_cpu_upper_bound", None) is not None:
+                common_attn_metadata.seq_lens_cpu_upper_bound += 1
 
             # Rebuild attention metadata
             _, per_layer_attn_metadata = self.build_per_group_and_layer_attn_metadata(
@@ -1428,16 +1443,33 @@ class SpecDecodeBaseProposer:
         Subclasses may override to apply additional config changes.
         """
         spec_cfg = self.speculative_config
+        base = self.vllm_config
+
         moe_backend = getattr(spec_cfg, "moe_backend", None)
         if moe_backend is not None:
-            return replace(
-                self.vllm_config,
+            base = replace(
+                base,
                 kernel_config=replace(
-                    self.vllm_config.kernel_config,
+                    base.kernel_config,
                     moe_backend=moe_backend,
                 ),
             )
-        return self.vllm_config
+
+        # Keep the drafter's attention backend independent from the target.
+        # The target may intentionally use FLASH_ATTN_V100, but Qwen MTP's
+        # full-attention drafter is much more sensitive to backend drift. Match
+        # upstream vLLM here: unless speculative_config explicitly provides a
+        # draft backend, reset to auto-selection instead of inheriting target.
+        attention_backend = getattr(spec_cfg, "attention_backend", None)
+        base = replace(
+            base,
+            attention_config=replace(
+                base.attention_config,
+                backend=attention_backend,
+            ),
+        )
+
+        return base
 
     def _get_model(self) -> nn.Module:
         """
@@ -1472,19 +1504,6 @@ class SpecDecodeBaseProposer:
         self._draft_attn_layer_names = (
             set(all_attn_layers.keys()) - target_attn_layer_names
         )
-
-        if self.supports_mm_inputs:
-            # Even if the target model is multimodal, we can also use
-            # text-only draft models
-            try:
-                dummy_input_ids = torch.tensor([[1]], device=self.input_ids.device)
-                self.model.embed_input_ids(dummy_input_ids, multimodal_embeddings=None)
-            except (NotImplementedError, AttributeError, TypeError):
-                logger.warning(
-                    "Draft model does not support multimodal inputs, "
-                    "falling back to text-only mode"
-                )
-                self.supports_mm_inputs = False
 
         if supports_multimodal(target_model):
             # handle multimodality
@@ -1521,6 +1540,19 @@ class SpecDecodeBaseProposer:
 
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(target_language_model)
+
+        if self.supports_mm_inputs:
+            # Even if the target model is multimodal, we can also use
+            # text-only draft models.
+            try:
+                dummy_input_ids = torch.tensor([[1]], device=self.input_ids.device)
+                self.model.embed_input_ids(dummy_input_ids, multimodal_embeddings=None)
+            except (NotImplementedError, AttributeError, TypeError):
+                logger.warning(
+                    "Draft model does not support multimodal inputs, "
+                    "falling back to text-only mode"
+                )
+                self.supports_mm_inputs = False
 
         if (
             self.parallel_drafting
@@ -1674,6 +1706,17 @@ class SpecDecodeBaseProposer:
                         logger.info(
                             "Shared target model lm_head with MTP shared_head.head."
                         )
+
+        if hasattr(target_language_model.model, "topk_indices_buffer"):
+            if hasattr(self.model.model, "topk_indices_buffer"):
+                del self.model.model.topk_indices_buffer
+            self.model.model.topk_indices_buffer = (
+                target_language_model.model.topk_indices_buffer
+            )
+            logger.info(
+                "Detected MTP model with topk_indices_buffer. "
+                "Sharing target model topk_indices_buffer with the draft model."
+            )
 
         if self.use_local_argmax_reduction:
             if not hasattr(self.model, "get_top_tokens"):
@@ -1929,9 +1972,8 @@ class EagleProposer(SpecDecodeBaseProposer):
         )
 
 
-# NOTE(woosuk): Currently, the below code is not used and we always use argmax
-# to sample the draft tokens. We will use this after we find a way to manage
-# the draft prob tensor.
+# Used by Qwen MTP for non-greedy sampling. Greedy requests still use the
+# local argmax path to avoid full-vocab logits/all-gather.
 # Refer to https://github.com/vllm-project/vllm/pull/16899 for the details.
 # FIXME(woosuk): The logic here is duplicated with the main sampling code.
 # We should refactor this to reuse the same sampling implementation.
@@ -1956,12 +1998,15 @@ def compute_probs_and_sample_next_token(
         is_greedy = temperature < _SAMPLING_EPS
         temperature = torch.where(is_greedy, 1.0, temperature)
     logits.div_(temperature.view(-1, 1))
+    # The draft proposal distribution q does not need to exactly match the
+    # target distribution p; rejection sampling corrects the final output.
+    # If top-k is present, keep draft sampling to top-k only to avoid top-p's
+    # full-vocab sort on every speculative step.
+    draft_top_p = (
+        None if sampling_metadata.top_k is not None else sampling_metadata.top_p
+    )
+    logits = apply_top_k_top_p(logits, sampling_metadata.top_k, draft_top_p)
     probs = logits.softmax(dim=-1, dtype=torch.float32)
-
-    # NOTE(woosuk): Currently, we ignore most of the sampling parameters in
-    # generating the draft tokens. We only use the temperature. While this
-    # could degrade the acceptance rate, it does not affect the distribution
-    # of the generated tokens after rejection sampling.
 
     # TODO(woosuk): Consider seeds.
     q = torch.empty_like(probs)
@@ -1973,3 +2018,25 @@ def compute_probs_and_sample_next_token(
         greedy_token_ids = probs.argmax(dim=-1)
         next_token_ids = torch.where(is_greedy, greedy_token_ids, next_token_ids)
     return next_token_ids, probs
+
+
+def _mtp_token_matching_sampling_enabled(
+    sampling_metadata: SamplingMetadata,
+) -> bool:
+    if os.getenv("VLLM_MTP_STOCHASTIC_TOKEN_MATCHING", "0") != "1":
+        return False
+    if sampling_metadata.max_num_logprobs is not None:
+        return False
+    if not sampling_metadata.no_penalties:
+        return False
+    if sampling_metadata.allowed_token_ids_mask is not None:
+        return False
+    if sampling_metadata.bad_words_token_ids:
+        return False
+    if sampling_metadata.generators:
+        return False
+    if sampling_metadata.logitsprocs.argmax_invariant:
+        return False
+    if sampling_metadata.logitsprocs.non_argmax_invariant:
+        return False
+    return True

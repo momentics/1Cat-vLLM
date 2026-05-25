@@ -1606,6 +1606,11 @@ class FusedMoE(CustomOp):
             return states
 
         def encode_layer_name() -> str:
+            if self.layer_name.startswith("mtp."):
+                # MTP drafter MoE calls do not share the target model's
+                # forward-context MoE layer order. Use the explicit static
+                # layer name to avoid resolving target MoE weights here.
+                return self.layer_name
             # Can be unavailable or None in unittests
             if (
                 is_forward_context_available()

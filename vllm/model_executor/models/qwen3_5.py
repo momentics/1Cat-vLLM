@@ -139,7 +139,9 @@ def _uses_split_gdn_input_projections(
     if not modules_to_not_convert:
         return False
     return any(
-        ("linear_attn.in_proj_a" in module_name)
+        module_name == "linear_attn"
+        or module_name.endswith(".linear_attn")
+        or ("linear_attn.in_proj_a" in module_name)
         or ("linear_attn.in_proj_b" in module_name)
         for module_name in modules_to_not_convert
     )

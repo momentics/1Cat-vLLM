@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 
 import torch
@@ -230,6 +231,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             quant_config=self.moe_quant_config,
             moe_config=self.moe,
         )
+        if os.getenv("VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE", "0") == "1":
+            self.use_inplace = False
+            logger.info_once(
+                "Disabling unquantized MoE inplace execution by env.",
+                scope="local",
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)

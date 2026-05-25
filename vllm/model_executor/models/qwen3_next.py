@@ -203,7 +203,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=f"{prefix}.gate",
         )
 
@@ -228,9 +228,15 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         else:
             self.shared_expert = None
 
+        use_overlapped_shared_moe = (
+            os.getenv("VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP", "0") == "1"
+            and os.getenv("VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP", "0")
+            != "1"
+        )
         self.experts = SharedFusedMoE(
             shared_experts=self.shared_expert,
             gate=self.gate,
+            use_overlapped=use_overlapped_shared_moe,
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, Any, Union
 
 import torch
@@ -8,7 +9,10 @@ from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import (
+    FusedMoE,
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -116,8 +120,38 @@ class AWQConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if is_layer_skipped(
+                prefix,
+                self.modules_to_not_convert,
+                self.packed_modules_mapping,
+                skip_with_substr=True,
+            ):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+
             # SM70 (V100): use TurboMind GEMM kernels for MoE,
             # since Marlin requires SM75+.
+            if (
+                self._is_sm70_available()
+                and os.getenv("VLLM_SM70_AWQ_MOE_DISABLE", "0") == "1"
+            ):
+                logger.warning_once(
+                    f"Layer '{prefix}' SM70 TurboMind MoE path disabled by "
+                    "VLLM_SM70_AWQ_MOE_DISABLE=1. Falling back to MoeWNA16."
+                )
+                from .moe_wna16 import MoeWNA16Config
+
+                config = {
+                    "quant_method": "awq",
+                    "bits": self.weight_bits,
+                    "group_size": self.group_size,
+                    "zero_point": self.zero_point,
+                    "lm_head": False,
+                    "modules_to_not_convert": self.modules_to_not_convert,
+                }
+                return MoeWNA16Config.from_config(config).get_quant_method(
+                    layer, prefix
+                )
+
             if self._is_sm70_available():
                 # SM70 (V100): TurboMind s884h kernels require:
                 #   K % 8 == 0, N % 8 == 0, K % group_size == 0

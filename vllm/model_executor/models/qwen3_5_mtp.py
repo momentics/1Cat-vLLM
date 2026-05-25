@@ -57,7 +57,13 @@ logger = init_logger(__name__)
     }
 )
 class Qwen3_5MultiTokenPredictor(nn.Module):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        share_target_embed_tokens: bool = False,
+    ):
         super().__init__()
 
         model_config = vllm_config.model_config
@@ -78,9 +84,13 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
+        self.embed_tokens = (
+            PPMissingLayer()
+            if share_target_embed_tokens
+            else VocabParallelEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+            )
         )
 
         self.fc = ColumnParallelLinear(
@@ -412,10 +422,18 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
             )
 
         self.quant_config = vllm_config.quant_config
+        self.share_target_io_weights = (
+            os.getenv("VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS", "1") != "0"
+        )
         mtp_vllm_config = vllm_config
-        if self.quant_config is not None and self._mtp_quant_disabled_in_hf_config(
-            config,
-            vllm_config.model_config.hf_config,
+        keep_quant = os.getenv("VLLM_QWEN35_MTP_KEEP_QUANT", "0") == "1"
+        if (
+            self.quant_config is not None
+            and not keep_quant
+            and self._mtp_quant_disabled_in_hf_config(
+                config,
+                vllm_config.model_config.hf_config,
+            )
         ):
             # Qwen3.5 AWQ checkpoints commonly keep the MTP branch in full
             # precision (`modules_to_not_convert` includes "mtp"), so trying to
@@ -432,11 +450,15 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         super().__init__()
         self.config = config
         self.model = Qwen3_5MultiTokenPredictor(
-            vllm_config=mtp_vllm_config, prefix=maybe_prefix(prefix, "mtp")
+            vllm_config=mtp_vllm_config,
+            prefix=maybe_prefix(prefix, "mtp"),
+            share_target_embed_tokens=self.share_target_io_weights,
         )
 
         if get_pp_group().is_last_rank:
-            if config.tie_word_embeddings:
+            if self.share_target_io_weights:
+                self.lm_head = PPMissingLayer()
+            elif config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
                 self.lm_head = ParallelLMHead(

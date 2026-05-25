@@ -1387,6 +1387,9 @@ class EngineArgs:
         self.tokenizer = model_config.tokenizer
 
         self._check_feature_supported(model_config)
+        self._maybe_apply_qwen35_sm70_mtp_server_defaults(
+            usage_context, model_config
+        )
         self._set_default_chunked_prefill_and_prefix_caching_args(model_config)
         self._set_default_max_num_seqs_and_batched_tokens_args(
             usage_context, model_config
@@ -1990,6 +1993,163 @@ class EngineArgs:
                 "disabling it for V1 backend."
             )
             self.enable_prefix_caching = False
+
+    def _maybe_apply_qwen35_sm70_mtp_server_defaults(
+        self,
+        usage_context: UsageContext | None,
+        model_config: ModelConfig,
+    ) -> None:
+        """Apply the public 1Cat V100/Qwen3.5 serving profile."""
+        if os.getenv("VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS"):
+            return
+        if getattr(usage_context, "name", None) != "OPENAI_API_SERVER":
+            return
+        if not current_platform.is_cuda_alike():
+            return
+        try:
+            cap = current_platform.get_device_capability()
+        except Exception:
+            return
+        if cap is None or cap.major != 7:
+            return
+
+        text_config = model_config.hf_text_config
+        model_type = getattr(text_config, "model_type", "")
+        if model_type not in (
+            "qwen3_5",
+            "qwen3_5_text",
+            "qwen3_5_moe",
+            "qwen3_5_moe_text",
+        ):
+            return
+        if not getattr(text_config, "mtp_num_hidden_layers", 0):
+            return
+        if not str(model_config.quantization).startswith("awq"):
+            return
+
+        is_moe_model = model_type in ("qwen3_5_moe", "qwen3_5_moe_text")
+        profile_updates: list[str] = []
+
+        if self.enable_prefix_caching is None:
+            self.enable_prefix_caching = True
+            profile_updates.append("enable_prefix_caching=True")
+
+        if self.speculative_config is None:
+            if is_moe_model:
+                # Qwen3.5/Qwen3.6 MoE AWQ checkpoints keep the MTP branch in
+                # full precision, which makes the V100 drafter too expensive to
+                # auto-enable until it has a quantized/SM70 path.
+                profile_updates.append("speculative_config=none_for_moe")
+            else:
+                self.speculative_config = {
+                    "method": "mtp",
+                    "num_speculative_tokens": 4,
+                    "use_local_argmax_reduction": True,
+                }
+                profile_updates.append("speculative_config=mtp4")
+                profile_updates.append(
+                    "speculative_config.use_local_argmax_reduction=True"
+                )
+        elif (
+            isinstance(self.speculative_config, dict)
+            and self.speculative_config.get("method") == "mtp"
+            and "use_local_argmax_reduction" not in self.speculative_config
+        ):
+            self.speculative_config["use_local_argmax_reduction"] = True
+            profile_updates.append(
+                "speculative_config.use_local_argmax_reduction=True"
+            )
+
+        if self.max_num_batched_tokens is None:
+            self.max_num_batched_tokens = 8192
+            profile_updates.append("max_num_batched_tokens=8192")
+
+        if self.max_num_seqs is None:
+            self.max_num_seqs = 4 if self.tensor_parallel_size >= 4 else 1
+            profile_updates.append(f"max_num_seqs={self.max_num_seqs}")
+
+        if self.compilation_config.cudagraph_capture_sizes is None:
+            cudagraph_capture_sizes = (
+                [1, 2, 4, 8, 9, 18]
+                if self.tensor_parallel_size >= 4
+                else [1, 2, 4, 8, 9]
+            )
+            if (
+                isinstance(self.speculative_config, dict)
+                and self.speculative_config.get("method") == "mtp"
+            ):
+                num_speculative_tokens = int(
+                    self.speculative_config.get("num_speculative_tokens") or 0
+                )
+                if num_speculative_tokens > 0:
+                    decode_query_len = num_speculative_tokens + 1
+                    max_num_seqs = max(int(self.max_num_seqs or 1), 1)
+                    cudagraph_capture_sizes = sorted(
+                        set(cudagraph_capture_sizes)
+                        | {
+                            decode_query_len * num_reqs
+                            for num_reqs in range(1, max_num_seqs + 1)
+                        }
+                    )
+                    profile_updates.append(
+                        "mtp_verifier_cudagraph_shapes="
+                        f"{decode_query_len}x1..{max_num_seqs}"
+                    )
+            self.compilation_config.cudagraph_capture_sizes = (
+                cudagraph_capture_sizes
+            )
+            profile_updates.append(
+                "cudagraph_capture_sizes="
+                f"{self.compilation_config.cudagraph_capture_sizes}"
+            )
+
+        if self.gpu_memory_utilization == CacheConfig.gpu_memory_utilization:
+            self.gpu_memory_utilization = (
+                0.88 if self.tensor_parallel_size >= 4 else 0.849
+            )
+            profile_updates.append(
+                f"gpu_memory_utilization={self.gpu_memory_utilization}"
+            )
+
+        layer_types = getattr(text_config, "layer_types", None) or []
+        has_linear_attention = any(
+            layer_type == "linear_attention" for layer_type in layer_types
+        )
+        if (
+            self.enable_prefix_caching
+            and has_linear_attention
+            and self.mamba_cache_mode == CacheConfig.mamba_cache_mode
+        ):
+            self.mamba_cache_mode = "align"
+            profile_updates.append("mamba_cache_mode=align")
+
+        if model_config.is_multimodal_model:
+            mm_config = model_config.multimodal_config
+            if not self.limit_mm_per_prompt:
+                text_only_limits = {"image": 0, "video": 0}
+                self.limit_mm_per_prompt = text_only_limits
+                if mm_config is not None:
+                    mm_config.limit_per_prompt = MultiModalConfig(
+                        limit_per_prompt=text_only_limits
+                    ).limit_per_prompt
+                profile_updates.append("limit_mm_per_prompt=text-only")
+            if self.mm_processor_cache_gb == MultiModalConfig.mm_processor_cache_gb:
+                self.mm_processor_cache_gb = 0
+                if mm_config is not None:
+                    mm_config.mm_processor_cache_gb = 0
+                profile_updates.append("mm_processor_cache_gb=0")
+            if self.skip_mm_profiling == MultiModalConfig.skip_mm_profiling:
+                self.skip_mm_profiling = True
+                if mm_config is not None:
+                    mm_config.skip_mm_profiling = True
+                profile_updates.append("skip_mm_profiling=True")
+
+        if profile_updates:
+            logger.info_once(
+                "Applied 1Cat SM70 Qwen3.5/Qwen3.6 server defaults: %s. "
+                "Set VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS=1 to disable.",
+                ", ".join(profile_updates),
+            )
 
     def _set_default_max_num_seqs_and_batched_tokens_args(
         self,

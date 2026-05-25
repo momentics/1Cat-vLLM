@@ -4,7 +4,7 @@
 import ast
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
-from pydantic import Field, SkipValidation, model_validator
+from pydantic import Field, SkipValidation, field_validator, model_validator
 from typing_extensions import Self
 
 from vllm.config.model import ModelConfig
@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -88,6 +89,9 @@ class SpeculativeConfig:
     """Quantization method that was used to quantize the draft model weights.
     If `None`, we assume the model weights are not quantized. Note that it only
     takes effect when using the draft model-based speculative method."""
+    attention_backend: AttentionBackendEnum | None = None
+    """Attention backend to use for the draft model. When `None`, the backend is
+    automatically selected."""
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""
@@ -672,6 +676,15 @@ class SpeculativeConfig:
         )
 
         return draft_parallel_config
+
+    @field_validator("attention_backend", mode="before")
+    @classmethod
+    def _parse_attention_backend(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            if value.lower() == "auto":
+                return None
+            return AttentionBackendEnum[value.upper()]
+        return value
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:

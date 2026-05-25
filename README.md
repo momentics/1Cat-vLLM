@@ -537,6 +537,8 @@ Important wording:
 - Keep `max_num_seqs=1` for the baseline public commands until your workload
   has been profiled locally. The MTP + prefix-cache profile intentionally uses
   `max_num_seqs=4`.
+- On V100, Qwen3.6/Qwen3.5 AWQ checkpoints with bundled MTP layers automatically
+  use the public MTP4 server profile unless the related flags are overridden.
 - On 2 x 32 GB V100, keep the 27B MTP profile at `max_num_seqs=1`. The TP4
   MTP setting `max_num_seqs=4` does not fit in 64 GB at 256K context.
 - On 32 GB V100 with `FLASH_ATTN_V100`, the baseline API
@@ -579,50 +581,37 @@ python -m vllm.entrypoints.openai.api_server \
 
 This is the recommended MTP serving profile for the `Qwen3.6-27B-AWQ` model on
 4 x V100 32 GB. It keeps the public 256K context default, enables prefix cache
-for repeated prompts, and uses `num_speculative_tokens=4`, which was the stable
-public MTP profile used for Cherry Studio/OpenClaw-style API testing.
+for repeated prompts, and defaults to `num_speculative_tokens=4`. MTP8 can be
+faster on stable coding prompts, but MTP4 is the public default because it is
+more balanced on divergent prompts.
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
   --model /path/to/Qwen3.6-27B-AWQ \
   --served-model-name qwen3.6-27b-awq-mtp \
   --trust-remote-code \
-  --dtype float16 \
-  --quantization awq \
-  --attention-backend FLASH_ATTN_V100 \
   --tensor-parallel-size 4 \
-  --gpu-memory-utilization 0.88 \
-  --kv-cache-auto-trim-ratio 0.0 \
-  --max-model-len 262144 \
-  --max-num-seqs 4 \
-  --max-num-batched-tokens 8192 \
-  --enable-prefix-caching \
-  --mamba-cache-mode align \
-  --skip-mm-profiling \
-  --mm-processor-cache-gb 0 \
-  --limit-mm-per-prompt '{"image":0,"video":0}' \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
-  --default-chat-template-kwargs '{"enable_thinking": false}' \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":4}' \
-  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8,9,18]}' \
   --host 0.0.0.0 \
   --port 8000
 ```
 
-Do not remove these MTP-profile options unless you are deliberately changing
-runtime behavior:
+On V100, 1Cat-vLLM automatically applies the public Qwen3.6 MTP profile for
+this model family:
 
-- `--kv-cache-auto-trim-ratio 0.0` disables 1Cat-vLLM's default KV auto-trim
-  (`1.05`) and leaves more room for retained prefix-cache blocks.
-- `--mamba-cache-mode align` is required for the Qwen3.6 hybrid Mamba path when
-  prefix caching and MTP are used together.
-- `--mm-processor-cache-gb 0`, `--skip-mm-profiling`, and
-  `--limit-mm-per-prompt '{"image":0,"video":0}'` keep this public profile
-  text-only and avoid unnecessary multimodal processor cache/profiling.
-- `--compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8,9,18]}'`
-  captures the MTP decode shapes used by this TP4 profile. Omitting it can
-  reduce CUDA graph hit rate and noticeably lower decode throughput.
+- MTP4 speculative decoding.
+- 256K context from the model config.
+- `max_num_seqs=4` and `max_num_batched_tokens=8192` for TP4.
+- Prefix cache with `mamba_cache_mode=align`.
+- Text-only multimodal defaults to avoid unnecessary vision cache/profiling.
+- `gpu_memory_utilization=0.88`; KV auto-trim remains enabled unless you
+  explicitly pass `--kv-cache-auto-trim-ratio 0`.
+- MTP4 CUDA graph capture sizes used by the validated TP4/TP2 profiles.
+
+If you need a non-default experiment, override the relevant flag explicitly.
+For example, use `--speculative-config '{"method":"mtp","num_speculative_tokens":8}'`
+to benchmark MTP8.
 
 Do not set `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` for this public MTP profile.
 That dense fast path is experimental and should be benchmarked separately from
@@ -630,8 +619,8 @@ the stable serving command.
 
 If decode throughput is much lower than expected, check `/metrics` for the MTP
 acceptance length first. This profile should keep acceptance around 4 on the
-tested coding prompts; falling to about 1.5-2 usually means the MTP CUDA graph
-capture sizes were changed or omitted.
+tested coding prompts; falling to about 1.5-2 usually means the prompt is too
+divergent for speculative decoding or a tuning flag was overridden.
 
 For speed-only experiments without prefix cache or tool calling, use
 `--max-num-seqs 1`, remove `--enable-prefix-caching`,
@@ -649,32 +638,16 @@ python -m vllm.entrypoints.openai.api_server \
   --model /path/to/Qwen3.6-27B-AWQ \
   --served-model-name qwen3.6-27b-awq-mtp-tp2 \
   --trust-remote-code \
-  --dtype float16 \
-  --quantization awq \
-  --attention-backend FLASH_ATTN_V100 \
   --tensor-parallel-size 2 \
-  --gpu-memory-utilization 0.849 \
-  --kv-cache-auto-trim-ratio 0.0 \
-  --max-model-len 262144 \
-  --max-num-seqs 1 \
-  --max-num-batched-tokens 8192 \
-  --enable-prefix-caching \
-  --mamba-cache-mode align \
-  --skip-mm-profiling \
-  --mm-processor-cache-gb 0 \
-  --limit-mm-per-prompt '{"image":0,"video":0}' \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
-  --default-chat-template-kwargs '{"enable_thinking": false}' \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":4}' \
-  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8,9]}' \
   --host 0.0.0.0 \
   --port 8000
 ```
 
-Do not copy the TP4 `max_num_seqs=4` value into this TP2 profile. In local
-validation, it failed either at startup memory reservation or at KV-cache
-initialization.
+The same automatic profile is used, except TP2 defaults to `max_num_seqs=1` and
+`gpu_memory_utilization=0.849`. Do not copy the TP4 `max_num_seqs=4` value into
+this TP2 profile; it does not fit in 64 GB at 256K context.
 
 ### Qwen3.6-35B-A3B-AWQ, TP4, public 4-card default
 

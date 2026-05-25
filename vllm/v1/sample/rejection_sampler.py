@@ -3,6 +3,7 @@
 
 from collections.abc import Sequence
 from dataclasses import replace
+import os
 
 import torch
 import torch.nn as nn
@@ -19,11 +20,39 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 logger = init_logger(__name__)
 
+_SPEC_ALIGNMENT_DUMP_COUNT = 0
+
 PLACEHOLDER_TOKEN_ID: tl.constexpr = -1
 GREEDY_TEMPERATURE: tl.constexpr = 0
 # Maximum number of speculative draft tokens allowed per request in a single
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 128
+
+
+def _spec_alignment_dump_enabled() -> bool:
+    return os.getenv("VLLM_SPEC_DUMP_ALIGNMENT", "0") == "1"
+
+
+def _token_matching_sampling_enabled(
+    sampling_metadata: SamplingMetadata,
+) -> bool:
+    if os.getenv("VLLM_MTP_STOCHASTIC_TOKEN_MATCHING", "0") != "1":
+        return False
+    if sampling_metadata.max_num_logprobs is not None:
+        return False
+    if not sampling_metadata.no_penalties:
+        return False
+    if sampling_metadata.allowed_token_ids_mask is not None:
+        return False
+    if sampling_metadata.bad_words_token_ids:
+        return False
+    if sampling_metadata.generators:
+        return False
+    if sampling_metadata.logitsprocs.argmax_invariant:
+        return False
+    if sampling_metadata.logitsprocs.non_argmax_invariant:
+        return False
+    return True
 
 
 class RejectionSampler(nn.Module):
@@ -89,6 +118,13 @@ class RejectionSampler(nn.Module):
         """
         assert metadata.max_spec_len <= MAX_SPEC_LEN
 
+        if (
+            draft_probs is None
+            and not sampling_metadata.all_greedy
+            and _token_matching_sampling_enabled(sampling_metadata)
+        ):
+            return self._sample_by_token_matching(metadata, logits, sampling_metadata)
+
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
 
@@ -137,6 +173,50 @@ class RejectionSampler(nn.Module):
             sampling_metadata,
         )
 
+        global _SPEC_ALIGNMENT_DUMP_COUNT
+        should_dump_alignment = (
+            _spec_alignment_dump_enabled()
+            and _SPEC_ALIGNMENT_DUMP_COUNT < 3
+            and sum(metadata.num_draft_tokens) >= min(4, metadata.max_spec_len)
+        )
+        if should_dump_alignment:
+            _SPEC_ALIGNMENT_DUMP_COUNT += 1
+            with torch.no_grad():
+                k = min(10, target_logits.shape[-1])
+                target_topk = torch.topk(target_logits, k=k, dim=-1)
+                draft_token_ids_i64 = metadata.draft_token_ids.to(torch.int64)
+                draft_target_logits = target_logits.gather(
+                    1, draft_token_ids_i64.view(-1, 1)
+                ).squeeze(1)
+                payload = {
+                    "draft_token_ids": metadata.draft_token_ids.detach().cpu(),
+                    "num_draft_tokens": list(metadata.num_draft_tokens),
+                    "cu_num_draft_tokens": metadata.cu_num_draft_tokens.detach().cpu(),
+                    "target_argmax": target_logits.argmax(dim=-1).detach().cpu(),
+                    "target_topk_ids": target_topk.indices.detach().cpu(),
+                    "target_topk_values": target_topk.values.detach().cpu(),
+                    "draft_target_logits": draft_target_logits.detach().cpu(),
+                    "target_logits_indices": target_logits_indices.detach().cpu(),
+                    "bonus_logits_indices": bonus_logits_indices.detach().cpu(),
+                    "bonus_token_ids": bonus_token_ids.detach().cpu(),
+                    "all_greedy": sampling_metadata.all_greedy,
+                    "all_random": sampling_metadata.all_random,
+                }
+                if draft_probs is not None:
+                    payload["draft_token_probs"] = draft_probs.gather(
+                        1, draft_token_ids_i64.view(-1, 1)
+                    ).squeeze(1).detach().cpu()
+                    draft_topk = torch.topk(draft_probs, k=k, dim=-1)
+                    payload["draft_topk_ids"] = draft_topk.indices.detach().cpu()
+                    payload["draft_topk_values"] = draft_topk.values.detach().cpu()
+                dump_path = (
+                    f"/tmp/spec_alignment_pid{os.getpid()}_"
+                    f"{_SPEC_ALIGNMENT_DUMP_COUNT}.pt"
+                )
+                torch.save(payload, dump_path)
+                logger.warning("Dumped speculative alignment diagnostics to %s",
+                               dump_path)
+
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,
@@ -162,6 +242,53 @@ class RejectionSampler(nn.Module):
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
+        )
+
+    def _sample_by_token_matching(
+        self,
+        metadata: SpecDecodeMetadata,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput:
+        num_sampled_tokens = logits.shape[0]
+        temperature = expand_batch_to_tokens(
+            sampling_metadata.temperature,
+            metadata.cu_num_sampled_tokens,
+            num_sampled_tokens,
+            replace_from=GREEDY_TEMPERATURE,
+            replace_to=1,
+        )
+        top_k = None
+        if sampling_metadata.top_k is not None:
+            top_k = expand_batch_to_tokens(
+                sampling_metadata.top_k,
+                metadata.cu_num_sampled_tokens,
+                num_sampled_tokens,
+            )
+        top_p = None
+        if sampling_metadata.top_p is not None:
+            top_p = expand_batch_to_tokens(
+                sampling_metadata.top_p,
+                metadata.cu_num_sampled_tokens,
+                num_sampled_tokens,
+            )
+        expanded_sampling_metadata = replace(
+            sampling_metadata,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            max_num_logprobs=None,
+            output_token_ids=[],
+            spec_token_ids=None,
+        )
+        sampled_token_ids = self.sampler(
+            logits=logits,
+            sampling_metadata=expanded_sampling_metadata,
+        ).sampled_token_ids.view(-1)
+        output_token_ids = token_match_sample(metadata, sampled_token_ids)
+        return SamplerOutput(
+            sampled_token_ids=output_token_ids,
+            logprobs_tensors=None,
         )
 
     def _get_logprobs_tensors(
@@ -441,6 +568,29 @@ def rejection_sample(
     return output_token_ids
 
 
+def token_match_sample(
+    metadata: SpecDecodeMetadata,
+    sampled_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    batch_size = len(metadata.num_draft_tokens)
+    output_token_ids = torch.full(
+        (batch_size, metadata.max_spec_len + 1),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,
+        device=sampled_token_ids.device,
+    )
+    token_match_sample_kernel[(batch_size,)](
+        output_token_ids,
+        metadata.cu_num_draft_tokens,
+        metadata.draft_token_ids,
+        metadata.target_logits_indices,
+        metadata.bonus_logits_indices,
+        sampled_token_ids.to(torch.int32),
+        metadata.max_spec_len,
+    )
+    return output_token_ids
+
+
 def apply_sampling_constraints(
     logits: torch.Tensor,  # [num_tokens, vocab_size]
     cu_num_draft_tokens: torch.Tensor,  # [batch_size]
@@ -677,6 +827,44 @@ def rejection_greedy_sample_kernel(
     if not rejected:
         # If all tokens are accepted, append the bonus token.
         bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
+        tl.store(
+            output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens,
+            bonus_token_id,
+        )
+
+
+@triton.jit(do_not_specialize=["max_spec_len"])
+def token_match_sample_kernel(
+    output_token_ids_ptr,  # [batch_size, max_spec_len + 1]
+    cu_num_draft_tokens_ptr,  # [batch_size]
+    draft_token_ids_ptr,  # [num_tokens]
+    target_logits_indices_ptr,  # [num_tokens]
+    bonus_logits_indices_ptr,  # [batch_size]
+    sampled_token_ids_ptr,  # [num_tokens + batch_size]
+    max_spec_len,
+):
+    req_idx = tl.program_id(0)
+    start_idx = 0 if req_idx == 0 else tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
+    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
+    num_draft_tokens = end_idx - start_idx
+
+    rejected = False
+    for pos in range(num_draft_tokens):
+        if not rejected:
+            flat_pos = start_idx + pos
+            target_idx = tl.load(target_logits_indices_ptr + flat_pos)
+            target_token_id = tl.load(sampled_token_ids_ptr + target_idx)
+            draft_token_id = tl.load(draft_token_ids_ptr + flat_pos)
+            tl.store(
+                output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                target_token_id,
+            )
+            if target_token_id != draft_token_id:
+                rejected = True
+
+    if not rejected:
+        bonus_idx = tl.load(bonus_logits_indices_ptr + req_idx)
+        bonus_token_id = tl.load(sampled_token_ids_ptr + bonus_idx)
         tl.store(
             output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens,
             bonus_token_id,

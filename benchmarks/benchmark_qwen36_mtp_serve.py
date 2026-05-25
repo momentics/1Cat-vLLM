@@ -8,6 +8,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,6 @@ from transformers import AutoTokenizer
 
 DEFAULT_COMPILATION_CONFIG = {
     "cudagraph_mode": "full_and_piecewise",
-    "cudagraph_capture_sizes": [1, 2, 4, 8, 9, 18],
 }
 
 
@@ -54,19 +54,31 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="float16")
     parser.add_argument("--quantization", default="awq")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
+    parser.add_argument("--cpu-offload-gb", type=float, default=0.0)
     parser.add_argument("--kv-cache-auto-trim-ratio", type=float, default=0.0)
     parser.add_argument("--swap-space", type=int, default=4)
     parser.add_argument("--max-model-len", type=int, default=4608)
     parser.add_argument("--max-num-batched-tokens", type=int, default=4608)
     parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument("--no-prefix-caching", action="store_true")
+    parser.add_argument("--disable-qwen35-defaults", action="store_true")
     parser.add_argument("--input-tokens", type=int, default=4096)
     parser.add_argument("--output-tokens", type=int, default=256)
     parser.add_argument("--prompt-text-file", default=None)
+    parser.add_argument("--api", choices=("completion", "chat"), default="completion")
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--repetition-penalty", type=float, default=None)
+    parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument("--num-speculative-tokens-list", type=_parse_int_list,
                         default=[1, 2, 3, 4, 6, 8])
+    parser.add_argument("--draft-attention-backend", default=None)
+    parser.add_argument("--disable-local-argmax-reduction", action="store_true")
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--num-warmups", type=int, default=1)
+    parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--request-rate", type=float, default=float("inf"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--result-dir", default="bench_results/qwen36_mtp_serve")
@@ -76,6 +88,7 @@ def _parse_args() -> argparse.Namespace:
         default=json.dumps(DEFAULT_COMPILATION_CONFIG),
     )
     parser.add_argument("--disable-custom-all-reduce", action="store_true")
+    parser.add_argument("--enforce-eager", action="store_true")
     return parser.parse_args()
 
 
@@ -83,12 +96,18 @@ def _scenarios(args: argparse.Namespace) -> list[Scenario]:
     scenarios: list[Scenario] = []
     if not args.skip_baseline:
         scenarios.append(Scenario(name="baseline", speculative_config=None))
+    speculative_extra = {}
+    if args.draft_attention_backend:
+        speculative_extra["attention_backend"] = args.draft_attention_backend
+    if args.disable_local_argmax_reduction:
+        speculative_extra["use_local_argmax_reduction"] = False
     scenarios.extend(
         Scenario(
             name=f"mtp_n{num_speculative_tokens}",
             speculative_config={
                 "method": "mtp",
                 "num_speculative_tokens": num_speculative_tokens,
+                **speculative_extra,
             },
         )
         for num_speculative_tokens in args.num_speculative_tokens_list
@@ -113,6 +132,8 @@ def _base_env(args: argparse.Namespace, scenario_dir: Path) -> dict[str, str]:
     env["VLLM_ATTENTION_BACKEND"] = args.attention_backend
     env["VLLM_SM70_ENABLE_LM_HEAD_FASTPATH"] = "1"
     env["VLLM_CACHE_ROOT"] = str(scenario_dir / "cache")
+    if args.disable_qwen35_defaults:
+        env["VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS"] = "1"
     return env
 
 
@@ -135,6 +156,8 @@ def _server_command(args: argparse.Namespace, scenario: Scenario,
         str(args.tensor_parallel_size),
         "--gpu-memory-utilization",
         str(args.gpu_memory_utilization),
+        "--cpu-offload-gb",
+        str(args.cpu_offload_gb),
         "--kv-cache-auto-trim-ratio",
         str(args.kv_cache_auto_trim_ratio),
         "--max-model-len",
@@ -161,8 +184,12 @@ def _server_command(args: argparse.Namespace, scenario: Scenario,
         "--compilation-config",
         args.compilation_config_json,
     ]
+    if args.no_prefix_caching:
+        command.append("--no-enable-prefix-caching")
     if args.disable_custom_all_reduce:
         command.append("--disable-custom-all-reduce")
+    if args.enforce_eager:
+        command.append("--enforce-eager")
     if scenario.speculative_config is not None:
         command.extend(
             ["--speculative-config", json.dumps(scenario.speculative_config)])
@@ -289,17 +316,25 @@ def _stream_completion(
     prompt_text: str,
     prompt_token_len: int,
     output_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float | None,
 ) -> dict[str, Any]:
     payload = {
         "model": model_name,
         "prompt": prompt_text,
-        "temperature": 0.0,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
         "max_tokens": output_tokens,
         "ignore_eos": True,
         "add_special_tokens": False,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if repetition_penalty is not None:
+        payload["repetition_penalty"] = repetition_penalty
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         f"{base_url}/v1/completions",
@@ -375,6 +410,142 @@ def _stream_completion(
     }
 
 
+def _stream_chat_completion(
+    *,
+    base_url: str,
+    model_name: str,
+    prompt_text: str,
+    prompt_token_len: int,
+    output_tokens: int,
+    enable_thinking: bool,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float | None,
+) -> dict[str, Any]:
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": prompt_text}],
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "max_completion_tokens": output_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "chat_template_kwargs": {"enable_thinking": enable_thinking},
+    }
+    if repetition_penalty is not None:
+        payload["repetition_penalty"] = repetition_penalty
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url}/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    start_s = time.perf_counter()
+    first_token_s: float | None = None
+    last_token_s: float | None = None
+    chunks = 0
+    text_parts: list[str] = []
+    usage: dict[str, Any] | None = None
+    with urllib.request.urlopen(request, timeout=1800) as response:
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or line.startswith(":") or not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+            obj = json.loads(data)
+            now_s = time.perf_counter()
+            if obj.get("usage") is not None:
+                usage = obj["usage"]
+            for choice in obj.get("choices") or []:
+                delta = choice.get("delta") or {}
+                piece = delta.get("content") or delta.get("reasoning_content") or ""
+                if piece:
+                    chunks += 1
+                    if first_token_s is None:
+                        first_token_s = now_s
+                    last_token_s = now_s
+                    text_parts.append(piece)
+    end_s = time.perf_counter()
+
+    prompt_tokens = (
+        prompt_token_len
+        if usage is None
+        else int(usage.get("prompt_tokens") or prompt_token_len)
+    )
+    completion_tokens = (
+        output_tokens
+        if usage is None
+        else int(usage.get("completion_tokens") or output_tokens)
+    )
+    wall_s = end_s - start_s
+    if first_token_s is None:
+        ttft_ms = None
+        decode_throughput = None
+    else:
+        ttft_ms = (first_token_s - start_s) * 1000.0
+        if last_token_s is not None and completion_tokens > 1 and last_token_s > first_token_s:
+            decode_throughput = (completion_tokens - 1) / (last_token_s - first_token_s)
+        else:
+            decode_throughput = None
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "wall_s": wall_s,
+        "mean_ttft_ms": ttft_ms,
+        "prefill_tps": (
+            prompt_tokens / (ttft_ms / 1000.0)
+            if ttft_ms is not None and ttft_ms > 0
+            else None
+        ),
+        "decode_throughput": decode_throughput,
+        "output_throughput": (
+            completion_tokens / wall_s if wall_s > 0 else None
+        ),
+        "chunks": chunks,
+        "text_head": "".join(text_parts)[:200],
+    }
+
+
+def _stream_request(
+    *,
+    args: argparse.Namespace,
+    base_url: str,
+    model_name: str,
+    prompt_text: str,
+    prompt_token_len: int,
+) -> dict[str, Any]:
+    if args.api == "chat":
+        return _stream_chat_completion(
+            base_url=base_url,
+            model_name=model_name,
+            prompt_text=prompt_text,
+            prompt_token_len=prompt_token_len,
+            output_tokens=args.output_tokens,
+            enable_thinking=args.enable_thinking,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            repetition_penalty=args.repetition_penalty,
+        )
+    return _stream_completion(
+        base_url=base_url,
+        model_name=model_name,
+        prompt_text=prompt_text,
+        prompt_token_len=prompt_token_len,
+        output_tokens=args.output_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        repetition_penalty=args.repetition_penalty,
+    )
+
+
 def _run_direct_benchmark(
     *,
     args: argparse.Namespace,
@@ -387,22 +558,78 @@ def _run_direct_benchmark(
     base_url = f"http://{args.host}:{port}"
     served_model_name = f"{args.served_model_name}-{scenario.name}"
     for _ in range(args.num_warmups):
-        _stream_completion(
+        _stream_request(
+            args=args,
             base_url=base_url,
             model_name=served_model_name,
             prompt_text=prompt_text,
             prompt_token_len=prompt_token_len,
-            output_tokens=args.output_tokens,
         )
 
     before = _fetch_spec_decode_metrics(base_url)
-    result = _stream_completion(
-        base_url=base_url,
-        model_name=served_model_name,
-        prompt_text=prompt_text,
-        prompt_token_len=prompt_token_len,
-        output_tokens=args.output_tokens,
-    )
+    if args.concurrency <= 1:
+        result = _stream_request(
+            args=args,
+            base_url=base_url,
+            model_name=served_model_name,
+            prompt_text=prompt_text,
+            prompt_token_len=prompt_token_len,
+        )
+    else:
+        start_s = time.perf_counter()
+        request_results: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+            futures = [
+                executor.submit(
+                    _stream_request,
+                    args=args,
+                    base_url=base_url,
+                    model_name=served_model_name,
+                    prompt_text=prompt_text,
+                    prompt_token_len=prompt_token_len,
+                )
+                for _ in range(args.concurrency)
+            ]
+            for request_idx, future in enumerate(as_completed(futures)):
+                request_result = future.result()
+                request_result["request_idx"] = request_idx
+                request_results.append(request_result)
+        wall_s = time.perf_counter() - start_s
+        completion_tokens = sum(
+            int(item.get("completion_tokens") or 0)
+            for item in request_results
+        )
+        prompt_tokens = sum(
+            int(item.get("prompt_tokens") or prompt_token_len)
+            for item in request_results
+        )
+        ttfts = [
+            float(item["mean_ttft_ms"])
+            for item in request_results
+            if item.get("mean_ttft_ms") is not None
+        ]
+        result = {
+            "concurrency": args.concurrency,
+            "request_results": request_results,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "wall_s": wall_s,
+            "mean_ttft_ms": _median(ttfts),
+            "prefill_tps": (
+                prompt_tokens / ((_median(ttfts) or 0.0) / 1000.0)
+                if ttfts and (_median(ttfts) or 0.0) > 0.0
+                else None
+            ),
+            "decode_throughput": (
+                completion_tokens / wall_s if wall_s > 0.0 else None
+            ),
+            "output_throughput": (
+                completion_tokens / wall_s if wall_s > 0.0 else None
+            ),
+            "text_head": (
+                request_results[0].get("text_head") if request_results else ""
+            ),
+        }
     after = _fetch_spec_decode_metrics(base_url)
 
     delta_drafts = after[0] - before[0]

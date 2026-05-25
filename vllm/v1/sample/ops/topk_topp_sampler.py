@@ -259,6 +259,12 @@ def apply_top_k_top_p(
         # Avoid sorting vocab for top-k only case.
         return apply_top_k_only(logits, k)
 
+    if k is not None:
+        # Qwen official sampling commonly uses top_k=20 and top_p=0.95.
+        # Apply top-p inside the already-small top-k set instead of sorting the
+        # whole vocab for every speculative verifier row.
+        return apply_top_k_top_p_top_k_first(logits, k, p)
+
     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
 
     if k is not None:
@@ -280,6 +286,42 @@ def apply_top_k_top_p(
 
     # Re-sort the probabilities.
     logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
+    return logits
+
+
+def apply_top_k_top_p_top_k_first(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    p: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Apply top-k and top-p masks without a full-vocab sort.
+
+    This matches the top-k + top-p behavior for normal non-tied logits by first
+    selecting top-k candidates, then sorting only those candidates for nucleus
+    filtering. Ties at the top-k or top-p boundary may be resolved by topk order,
+    which is acceptable for model logits and avoids the hot full-vocab sort.
+    """
+    max_top_k = k.max()
+    topk_values, topk_indices = logits.topk(max_top_k, dim=1)
+
+    topk_offsets = torch.arange(max_top_k, device=logits.device).unsqueeze(0)
+    valid_topk = topk_offsets < k.to(torch.long).unsqueeze(1)
+    topk_values = topk_values.masked_fill(~valid_topk, -float("inf"))
+
+    topk_sort, topk_order = topk_values.sort(dim=-1, descending=False)
+    probs_sort = topk_sort.softmax(dim=-1)
+    probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
+    top_p_mask_sort = probs_sum <= 1 - p.unsqueeze(dim=1)
+    top_p_mask_sort[:, -1] = False
+
+    keep_sort = ~top_p_mask_sort
+    keep_topk = torch.zeros_like(keep_sort).scatter(1, topk_order, keep_sort)
+    keep_topk.logical_and_(valid_topk)
+
+    keep_logits = torch.zeros_like(logits, dtype=torch.bool)
+    keep_logits.scatter_(1, topk_indices, keep_topk)
+    logits.masked_fill_(~keep_logits, -float("inf"))
     return logits
 
 
