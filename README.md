@@ -1,230 +1,97 @@
-# 1Cat-vLLM 1.0.0
+# 1Cat-vLLM
 
 > 一猫之下始终相信，V100 不该在今天的大模型浪潮里被轻易宣判“过时”。
-> `1Cat-vLLM 1.0.0` 不是一次简单的适配更新，而是一次面向
-> **SM70 / Tesla V100** 的系统性工程重构。我们围绕 AWQ、注意力后端、
-> 长上下文稳定性、运行时默认值和部署路径做了成体系的打磨，极大提升了
-> V100 的模型使用上限，让更多原本“难以跑起来、难以跑稳定、难以跑得快”
-> 的现代模型场景，真正变得可用、好用、能持续部署。
 >
-> 在我们聚焦和验证过的 V100 场景里，这个版本不仅显著抬升了上下文能力与
-> 部署稳定性，也带来了业界领先的推理速度表现。对还在使用 V100 的个人开发者、
-> 工作室和团队来说，这意味着老卡依然有很强的生命力，依然值得被继续挖掘。
-> 我们真心希望 V100 开源社区越来越好，也希望把一猫之下自己的工程经验、
-> 优化成果和热情，实实在在地贡献给社区。感谢每一位关注、使用、反馈和支持
-> 一猫之下的朋友。你们的支持，是我们继续把这件事做深、做久、做好的动力。
+> 1Cat-vLLM 是面向 **SM70 / Tesla V100** 的 vLLM 工程分支。项目围绕
+> AWQ、注意力后端、长上下文稳定性、MTP 投机解码、运行时默认值和部署
+> 路径做了成体系的优化，让更多现代模型场景在 V100 上真正变得可用、
+> 好用、能持续部署。
+>
+> 我们希望把一猫之下在 V100 上的工程经验、优化成果和验证过程贡献给
+> 开源社区，也欢迎继续使用 V100 的个人开发者、工作室和团队一起反馈、
+> 复现和改进。
 
-`1Cat-vLLM 1.0.0` is the recommended public release of the
-**Tesla V100 / SM70** vLLM fork for
-**AWQ 4-bit inference on Volta GPUs,and FlashAttn-2!!**.
+1Cat-vLLM is a **Tesla V100 / SM70** focused vLLM fork for serving modern
+Qwen-class AWQ and experimental FP8 models on Volta GPUs. It integrates
+TurboMind-derived SM70 kernels, a V100 FlashAttention path, runtime defaults
+for long-context serving, and OpenAI-compatible API fixes for common clients.
 
-Upstream vLLM AWQ kernels normally require **SM75+** in the default path.
-This branch integrates **lmdeploy TurboMind SM70 WMMA kernels**,
-**FLASH_ATTN_V100**, and a set of SM70-specific runtime fixes so that V100 can
-serve modern AWQ models, especially **Qwen3.5 / Qwen3.6 dense and MoE models**.
+## Project Focus
 
-Compared with the earlier `0.0.x` line, `1.0.0` focuses on the new V100
-attention backend, Qwen3.5/Qwen3.6 model coverage, FP8 KV cache support,
-MTP serving, output-quality stability fixes, and a cleaner public wheel
-installation path. The validated default path now centers on the prebuilt
-`v1.0.0` wheels and `FLASH_ATTN_V100` instead of source builds or the older
-Triton attention fallback.
+- **V100 / SM70 first**: optimized for Tesla V100 rather than being a generic
+  multi-hardware fork.
+- **AWQ on Volta**: AWQ 4-bit inference paths for dense and MoE Qwen models on
+  SM70.
+- **V100 FlashAttention path**: `FLASH_ATTN_V100` decode and prefill backend
+  for Volta GPUs.
+- **Long-context serving**: public profiles default to 256K context where the
+  model and memory budget allow it.
+- **MTP serving**: Qwen3.6-class MTP speculative decoding with safer defaults
+  for V100.
+- **Tool calling and OpenAI API compatibility**: validated with OpenAI-style
+  clients such as Cherry Studio, OpenClaw, and similar tools.
+- **Experimental FP8 work**: FP8 model and KV-cache paths are included for
+  validation, but they are not production defaults.
+- **Experimental DFlash work**: included for continued research and validation.
 
-## Recommended model providers
+## Recommended Model Providers
 
 - `tclf90/Qwen3.6-27B-AWQ`
 - `tclf90/Qwen3.6-35B-A3B-AWQ`
 - `tclf90/Qwen3.5-122B-A10B-AWQ` for larger 4-GPU setups
 
-The launch commands below use short model names such as
-`Qwen3.5-27B-AWQ` and `Qwen3.6-35B-A3B-AWQ`.
+The launch examples use local paths such as `/path/to/Qwen3.6-27B-AWQ`.
+Replace them with your local model path or a Hugging Face repository id.
 
-This assumes one of the following is true:
+## Hardware Target
 
-- you have local model directories with exactly these names
-- you replace `--model` with your real local path
-- you replace `--model` with the full Hugging Face repo id
+The public commands are written for V100 text-generation workloads.
 
-## What this branch adds
-
-- AWQ 4-bit support for **SM70 / Tesla V100**
-- Dense and MoE AWQ execution paths on V100
-- Reuse of SM70 AWQ kernels for selected compressed-tensors MoE paths
-- `FLASH_ATTN_V100` decode and prefill backend for Volta GPUs
-- Qwen3.5 / Qwen3.6 model and config support, including MoE and MTP paths
-- SM70-specific MLA/GDN runtime fixes
-- Compatibility with `torch.compile` and CUDA graphs
-- OpenAI-compatible API serving through standard vLLM entrypoints
-
-## What is new in 1.0.0
-
-- A release step forward over `0.0.3` for **V100-flash-attention**, Qwen3.5/Qwen3.6
-  coverage, public packaging, and output-quality stability
-- A **two-wheel** installation path for `Python 3.12 + CUDA 12.8`
-  (`flash_attn_v100` plus `vllm`)
-- FP8 KV cache support for the V100 FA path, with `fp8_e5m2` documented as the
-  current experimental V100 option
-- MTP speculative decoding support for Qwen3.6-class models
-- Tool-calling and OpenAI-compatible API fixes for Cherry Studio, OpenClaw, and
-  similar OpenAI API clients
-- DFlash is included as an experimental path for continued validation
-- Public runtime defaults now center on:
-  - `--attention-backend FLASH_ATTN_V100`
-  - `--max-model-len 262144`
-  - explicit low-concurrency serving limits such as `--max-num-seqs` and
-    `--max-num-batched-tokens`
-- V100 `32 GB` reference configs for 4-card systems:
-  - `Qwen3.5-27B-AWQ`
-  - `Qwen3.6-35B-A3B-AWQ`
-  - `Qwen3.5-122B-A10B-AWQ`
-- Long-prompt chunk budget for `FLASH_ATTN_V100` on 32 GB V100 defaults to
-  `max_num_batched_tokens=16384`
-- Direct paged prefill remains experimental and is not the public default
-
-## Reference hardware platforms
-
-`1.0.0` is validated primarily on 4-card V100 systems. The recommended public
-commands below assume **4 x V100 32 GB** and text-generation workloads.
-
-| Public reference host | Notes |
+| Host | Notes |
 | --- | --- |
-| 4 x Tesla PG503 / V100 32 GB | Recommended target for Qwen3.5/Qwen3.6 AWQ serving |
+| 4 x Tesla V100 32 GB | Main public reference target |
+| 2 x Tesla V100 32 GB | Supported for selected 27B MTP profiles with lower concurrency |
 
-- `Qwen3.5-27B-AWQ`: supported on TP1/TP2/TP4, with TP4 recommended for this README
-- `Qwen3.6-35B-A3B-AWQ`: TP4 recommended for the public command
-- `Qwen3.5-122B-A10B-AWQ`: TP4 only in the public command
+Typical model placement:
 
-## Benchmarks / Effort figures
+- `Qwen3.5-27B-AWQ`: TP1/TP2/TP4 supported; TP4 is the public reference.
+- `Qwen3.6-27B-AWQ`: TP4 public MTP profile; TP2 memory-constrained profile.
+- `Qwen3.6-35B-A3B-AWQ`: TP4 recommended.
+- `Qwen3.5-122B-A10B-AWQ`: TP4 only in the public examples.
 
-The following local `1.0.0` regression charts were generated on a 4-card V100
-32 GB system. First-request warmup is not included as steady-state throughput.
+## Validated Stack
 
-### Local test charts
+The public wheel path is validated on:
 
-| `Qwen3.5-27B-AWQ` | `Qwen3.6-35B-A3B-AWQ` | `Qwen3.5-122B-A10B-AWQ` |
-| --- | --- | --- |
-| [![Qwen3.5-27B-AWQ](docs/test-table/Tesla_PG503-32G_x4,1Cat-vLLM-0.0.3,Qwen3.5-27B-AWQ,20260501_001139.png)](docs/test-table/Tesla_PG503-32G_x4,1Cat-vLLM-0.0.3,Qwen3.5-27B-AWQ,20260501_001139.png) | [![Qwen3.6-35B-A3B-AWQ](docs/test-table/Tesla_PG503-32G_x4,1Cat-vLLM-0.0.3,Qwen3.6-35B-A3B-AWQ,20260501_002046.png)](docs/test-table/Tesla_PG503-32G_x4,1Cat-vLLM-0.0.3,Qwen3.6-35B-A3B-AWQ,20260501_002046.png) | [![Qwen3.5-122B-A10B-AWQ](docs/test-table/Tesla_PG503-32G_x4,1Cat-vLLM-0.0.3,Qwen3.5-122B-A10B-AWQ,20260501_004543.png)](docs/test-table/Tesla_PG503-32G_x4,1Cat-vLLM-0.0.3,Qwen3.5-122B-A10B-AWQ,20260501_004543.png) |
+- OS: Ubuntu 24.04 LTS
+- Python: 3.12
+- CUDA toolkit: 12.8
+- PyTorch: CUDA 12.8 runtime wheels
+- GPU: Tesla V100 32 GB
 
-- first-request warmup on V100 is slow and is not representative
-- long-context throughput depends strongly on `TP`, `max_num_seqs`, and the
-  attention backend
-- the public runtime defaults in this README prioritize stable serving over
-  peak single-case benchmark numbers
+## Runtime Notes
 
-### Reproducible 27B decode baseline
-
-The `1.0.0` 27B speed baseline is measured as **incremental decode TPS**:
-
-```text
-incremental_decode_tps =
-  (decode64_output_tokens - decode1_output_tokens) /
-  (decode64_median_latency - decode1_median_latency)
-```
-
-This removes prefill/TTFT from the measurement. It is stricter than API
-streaming throughput and should not be compared directly with browser-side
-OpenAI streaming numbers.
-
-Reference result on `4 x Tesla PG503 / V100 32 GB`:
-
-| Model | Backend | TP | Custom all-reduce | Short-context incremental decode | 8K-context incremental decode |
-| --- | --- | ---: | --- | ---: | ---: |
-| `Qwen3.5-27B-AWQ` | `FLASH_ATTN_V100` | 4 | enabled | `86.31 tok/s` | `79.04 tok/s` |
-
-Strict reproduction command. This speed-only harness intentionally keeps
-`max_model_len=12288` to match the historical model-side regression test. The
-public serving commands below default to 256K context with
-`max_model_len=262144`.
-
-```bash
-export ONECAT_VLLM_REPO=/path/to/1Cat-vLLM/vllm
-cd /tmp
-
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-HF_HUB_OFFLINE=1 \
-TRANSFORMERS_OFFLINE=1 \
-python "$ONECAT_VLLM_REPO/tools/vllm_v100_backend_regression.py" \
-  --child \
-  --backend FLASH_ATTN_V100 \
-  --model /path/to/Qwen3.5-27B-AWQ \
-  --dtype float16 \
-  --kv-cache-dtype auto \
-  --max-model-len 12288 \
-  --max-num-seqs 8 \
-  --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.88 \
-  --tensor-parallel-size 4 \
-  --prompt-style qwen35-chat \
-  --disable-thinking \
-  --disable-mm \
-  --quality-max-tokens 1 \
-  --long-prompt-tokens 8202 \
-  --speed-warmup 3 \
-  --speed-iters 5 \
-  --skip-quality \
-  --child-output /tmp/qwen35_27b_fa2_baseline.json
-```
-
-Expected key latencies:
-
-- `batch1_prefill512_decode1`: about `0.179 s`
-- `batch1_prefill512_decode64`: about `0.909 s`
-- incremental decode: about `86 tok/s`
-
-Do **not** add `--disable-custom-all-reduce` for the 27B TP4 baseline. On the
-same hardware this drops short-context incremental decode from about
-`86.31 tok/s` to about `75.91 tok/s`.
-
-## 微信交流群
-
-**群聊：** 1Cat-vLLM 开源交流群3
-
-请使用微信扫描下方二维码加入群组：
-
-![1Cat-vLLM 微信交流群二维码](docs/assets/wechat-group-qr.png)
-
-> 提示：微信群二维码通常 7 天内有效。若扫描失败或提示过期，请重新打开本页查看最新图片，或关注仓库更新。
-
-## Validated stack
-
-The commands in this README were validated on the following setup:
-
-- OS: `Ubuntu 24.04.4 LTS`
-- Python: `3.12.13`
-- CUDA toolkit: `12.8`
-- PyTorch: `2.9.1+cu128`
-- Triton: `3.5.1`
-- Driver: `570.211.01`
-- GPU: `4 x Tesla V100 32 GB` public reference profile
-
-The public launch commands below are written for 4-card V100 32 GB systems.
-
-## Runtime notes you should read first
-
-- The **first real request is not representative** of steady-state speed.
-  On V100, the first request may spend **1 to 3 minutes** compiling kernels,
-  building graphs, and warming up execution paths.
-- The public commands in this README are text-generation profiles. Vision or
-  multimodal workloads should be tuned separately.
-- For Qwen3.5/Qwen3.6 text-only serving on V100 32 GB, the recommended public
-  commands explicitly set only the serving choices that change behavior:
-  - `--attention-backend FLASH_ATTN_V100`
-  - `--max-model-len 262144`
-  - `--max-num-seqs` and `--max-num-batched-tokens`
-  - `--enable-prefix-caching` for the MTP + prefix-cache profile
-- `--gpu-memory-utilization` is an upper bound for the model executor. By
-  default, 1Cat-vLLM trims the final KV cache allocation to about
-  `1.05 * max_model_len * max_num_seqs`, so single-request 256K serving does
-  not preallocate KV capacity for many extra full-length requests. Set
-  `--kv-cache-auto-trim-ratio 0` to keep upstream vLLM's "use all requested
-  memory for KV cache" behavior, or use `--kv-cache-memory-bytes` for an exact
-  per-GPU KV cache size.
+- The **first real request is not representative** of steady-state speed. On
+  V100, the first request may spend 1 to 3 minutes compiling kernels, building
+  graphs, and warming up execution paths.
+- Public launch commands are text-generation profiles. Vision and multimodal
+  workloads should be tuned separately.
+- `FLASH_ATTN_V100` is the recommended attention backend for V100.
+- Public serving examples default to 256K context with
+  `--max-model-len 262144`.
+- Keep `--max-num-seqs 1` for baseline serving until your workload has been
+  profiled locally. The 27B MTP + prefix-cache profile intentionally uses
+  `max_num_seqs=4` on TP4.
+- `--gpu-memory-utilization` is an upper bound for model executor memory.
+  1Cat-vLLM trims the final KV cache allocation for long-context single-user
+  serving instead of always preallocating for many full-length requests.
 - `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` is experimental. Keep it disabled for
-  the public 35B/122B MoE commands.
-- Direct paged prefill can be forced with `VLLM_FLASH_V100_ENABLE_PAGED_PREFILL=1`,
-  but it is not the quality-safe default.
+  public 35B/122B MoE serving unless you are benchmarking that path directly.
+- Direct paged prefill can be forced with
+  `VLLM_FLASH_V100_ENABLE_PAGED_PREFILL=1`, but it is not the quality-safe
+  public default.
 
-## Quick start
+## Quick Start
 
 ### 1. Install CUDA 12.8
 
@@ -237,8 +104,8 @@ sudo apt update
 sudo apt install -y cuda-toolkit-12-8
 ```
 
-If the machine also has CUDA 13.x installed, force build-time and runtime CUDA
-to 12.8:
+If the machine also has another CUDA toolkit installed, force build-time and
+runtime CUDA to 12.8:
 
 ```bash
 export CUDA_HOME=/usr/local/cuda-12.8
@@ -248,60 +115,51 @@ hash -r
 nvcc -V
 ```
 
-### 2. Create the conda environment
+### 2. Create the Python environment
 
 ```bash
 source /path/to/miniconda3/etc/profile.d/conda.sh
-conda create -y -n 1Cat-vLLM-1.0.0 python=3.12
-conda activate 1Cat-vLLM-1.0.0
+conda create -y -n 1cat-vllm-sm70 python=3.12
+conda activate 1cat-vllm-sm70
 
 python -m pip install --upgrade pip setuptools wheel
 ```
 
-### 3. Recommended install path: prebuilt wheel
+### 3. Install from Prebuilt Wheels
 
-Use the release wheel if you only want to run the project. This is the
-recommended installation path. Source builds are for kernel development and are
-not recommended for normal deployment.
+Prebuilt wheels are the recommended installation path for public users. Source
+builds are intended for kernel development.
 
-The wheel install pulls the matching `torch==2.9.1+cu128` runtime from the
-PyTorch CUDA 12.8 index. `--no-cache-dir` is recommended because the CUDA
-runtime wheels are large.
+Download the latest wheel assets from:
 
-Install from a local wheel file:
-
-```bash
-python -m pip install --prefer-binary --no-cache-dir \
-  --extra-index-url https://download.pytorch.org/whl/cu128 \
-  ./dist-cu128-sm70-1.0.0/flash_attn_v100-*.whl \
-  ./dist-cu128-sm70-1.0.0/vllm-*.whl
+```text
+https://github.com/1CatAI/1Cat-vLLM/releases/latest
 ```
 
-Or install from a GitHub release asset:
+Install both wheels from the directory where you downloaded them:
 
 ```bash
 python -m pip install --prefer-binary --no-cache-dir \
   --extra-index-url https://download.pytorch.org/whl/cu128 \
-  "https://github.com/1CatAI/1Cat-vLLM/releases/download/v1.0.0/flash_attn_v100-1.0.0-cp312-cp312-linux_x86_64.whl" \
-  "https://github.com/1CatAI/1Cat-vLLM/releases/download/v1.0.0/vllm-1.0.0-cp312-cp312-linux_x86_64.whl"
+  ./flash_attn_v100-*.whl \
+  ./vllm-*.whl
 ```
 
 Notes:
 
-- This is the **recommended first installation path** for public users.
-- `flash_attn_v100` is a separate wheel and should be installed together with
-  the vLLM wheel.
-- Runtime installation from the wheels does not require the `lmdeploy` source
-  tree.
-- Use `Python 3.12` and `CUDA 12.8`.
-- If your shell has a broken local proxy configured, unset it before installing:
+- Install `flash_attn_v100` and `vllm` together.
+- Runtime installation from wheels does not require the bundled `lmdeploy`
+  source tree.
+- Use Python 3.12 and CUDA 12.8.
+- If your shell has a broken local proxy configured, unset it before
+  installing:
   `env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy ...`.
-- After installing from wheels, run `python -m vllm...` from a directory outside
-  this source checkout, such as `cd ~` or `cd /tmp`. Running inside the cloned
-  repository makes Python import the local `vllm/` source tree, which does not
-  contain the wheel-installed CUDA extension files such as `vllm/_C.abi3.so`.
+- After installing from wheels, run `python -m vllm...` from a directory
+  outside this source checkout, such as `cd ~` or `cd /tmp`. Running inside the
+  cloned repository makes Python import the local source tree instead of the
+  wheel-installed CUDA extensions.
 
-### 4. Verify the environment
+### 4. Verify the Environment
 
 ```bash
 python - <<'PY'
@@ -316,252 +174,38 @@ print("flash_attn_v100", "ok")
 PY
 ```
 
-## Docker deployment
-
-Docker deployment follows the same wheel-first approach. This release
-does not include a dedicated `1.0.0` wheel-runtime Dockerfile yet, so use the
-conda wheel path above for final local validation.
-
-### 1. Build the recommended SM70 runtime image
-
-```bash
-# No dedicated 1.0.0 wheel-runtime Dockerfile is included in this tree yet.
-# Use the conda wheel install path above, or adapt docker/Dockerfile for source build.
-```
-
-The first Docker build will download several gigabytes of PyTorch and CUDA
-runtime layers. The build context for this repository is already trimmed, but
-the Docker image store still lives under the host Docker root directory unless
-you have moved it yourself.
-
-This Dockerfile intentionally uses `python:3.12-slim-trixie`. The current
-SM70 wheel needs `glibc >= 2.38`, and the runtime image also keeps `gcc/g++`
-installed because Triton compiles a small helper module on first startup.
-
-This image is pinned to:
-
-- `Python 3.12`
-- `Debian trixie / glibc 2.41`
-- `torch 2.9.1`
-- `torchvision 0.24.1`
-- `torchaudio 2.9.1`
-- `gcc/g++` for Triton first-run compilation
-- the current `v1.0.0` release wheel
-
-The runtime entrypoint should include these public defaults:
-
-- `FLASH_ATTN_V100` as the V100 attention backend
-- `--max-model-len 262144`
-- explicit `max_num_seqs` and `max_num_batched_tokens` limits for the target
-  model
-
-If you want runtime caches to stay on a large disk, add these options to the
-`docker run` commands below:
-
-- `-v /path/to/1t-cache/hf:/cache/hf -e HF_HOME=/cache/hf`
-- `-v /path/to/1t-cache/triton:/cache/triton -e TRITON_CACHE_DIR=/cache/triton`
-- `-v /path/to/1t-cache/torchinductor:/cache/torchinductor -e TORCHINDUCTOR_CACHE_DIR=/cache/torchinductor`
-- `-v /path/to/1t-cache/tmp:/cache/tmp -e TMPDIR=/cache/tmp`
-
-Final Docker validation data will be added after the wheel-runtime image is
-rebuilt for `1.0.0`.
-
-### 2. Run on four `32 GB` V100 with `Qwen3.5-27B-AWQ`
-
-```bash
-docker run --rm \
-  --gpus '"device=0,1,2,3"' \
-  --ipc=host \
-  -p 8000:8000 \
-  -v /path/to/models:/models:ro \
-  -e VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
-  -e VLLM_MODEL=/models/Qwen3.5-27B-AWQ \
-  -e VLLM_SERVED_MODEL_NAME=Qwen3.5-27B-AWQ \
-  -e VLLM_TENSOR_PARALLEL_SIZE=4 \
-  -e VLLM_GPU_MEMORY_UTILIZATION=0.88 \
-  -e VLLM_MAX_MODEL_LEN=262144 \
-  -e VLLM_MAX_NUM_SEQS=1 \
-  -e VLLM_MAX_NUM_BATCHED_TOKENS=16384 \
-  1cat-vllm-sm70:1.0.0
-```
-
-### 3. Run on four `32 GB` V100 with `Qwen3.6-35B-A3B-AWQ`
-
-```bash
-docker run --rm \
-  --gpus '"device=0,1,2,3"' \
-  --ipc=host \
-  -p 8000:8000 \
-  -v /path/to/models:/models:ro \
-  -e VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
-  -e VLLM_MODEL=/models/Qwen3.6-35B-A3B-AWQ \
-  -e VLLM_SERVED_MODEL_NAME=Qwen3.6-35B-A3B-AWQ \
-  -e VLLM_TENSOR_PARALLEL_SIZE=4 \
-  -e VLLM_GPU_MEMORY_UTILIZATION=0.88 \
-  -e VLLM_MAX_MODEL_LEN=262144 \
-  -e VLLM_MAX_NUM_SEQS=1 \
-  -e VLLM_MAX_NUM_BATCHED_TOKENS=8192 \
-  1cat-vllm-sm70:1.0.0
-```
-
-### 4. Run on four `32 GB` V100 with `Qwen3.5-122B-A10B-AWQ`
-
-```bash
-docker run --rm \
-  --gpus '"device=0,1,2,3"' \
-  --ipc=host \
-  -p 8000:8000 \
-  -v /path/to/models:/models:ro \
-  -e VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
-  -e VLLM_MODEL=/models/Qwen3.5-122B-A10B-AWQ \
-  -e VLLM_SERVED_MODEL_NAME=Qwen3.5-122B-A10B-AWQ \
-  -e VLLM_TENSOR_PARALLEL_SIZE=4 \
-  -e VLLM_GPU_MEMORY_UTILIZATION=0.88 \
-  -e VLLM_MAX_MODEL_LEN=262144 \
-  -e VLLM_MAX_NUM_SEQS=1 \
-  -e VLLM_MAX_NUM_BATCHED_TOKENS=8096 \
-  1cat-vllm-sm70:1.0.0
-```
-
-### 5. Quick API check
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "Qwen3.5-27B-AWQ",
-    "messages": [{"role": "user", "content": "只回答最终结果：2+2等于几？"}],
-    "temperature": 0,
-    "max_completion_tokens": 16,
-    "chat_template_kwargs": {"enable_thinking": false}
-  }'
-```
-
-### 6. Container source build
-
-Container source build is still available through the upstream-style
-multi-stage [`docker/Dockerfile`](docker/Dockerfile), but it is not the
-recommended first path for public users.
-
-For this fork, the recommended public Docker path is still the released wheel
-image above.
-
-## Source build
-
-Source build is still supported, but it is **not recommended** for public
-runtime deployment. Install the release wheels first unless you are changing
-CUDA/C++/Triton code.
-
-Only use it if:
-
-- you want to modify CUDA or Triton code
-- you want to rebuild your own wheel
-- you are doing development on this fork
-
-### 1. Bundled `lmdeploy` source dependency
-
-This repository already includes the validated `lmdeploy` source tree needed
-for the SM70 AWQ build path.
-
-```bash
-cd /path/to/vllm
-test -d lmdeploy
-```
-
-### 2. Install build dependencies
-
-```bash
-cd /path/to/vllm
-source /path/to/miniconda3/etc/profile.d/conda.sh
-conda activate 1Cat-vLLM-1.0.0
-
-python -m pip install -r requirements/build.txt
-python -m pip install -r requirements/cuda.txt
-python -m pip install -r requirements/common.txt
-python -m pip install cmake build
-```
-
-### 3. Build from source
-
-The current validated `1.0.0` source build uses `CUDA 12.8`, `SM70`, and
-`MAX_JOBS=12`.
-
-```bash
-cd /path/to/vllm
-source /path/to/miniconda3/etc/profile.d/conda.sh
-conda activate 1Cat-vLLM-1.0.0
-
-export CUDA_HOME=/usr/local/cuda-12.8
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
-export TORCH_CUDA_ARCH_LIST="7.0"
-export MAX_JOBS=12
-export NVCC_THREADS=1
-
-rm -rf build vllm.egg-info
-rm -rf .deps/*-build .deps/*-subbuild
-
-pushd flash-attention-v100
-python -m build --wheel --no-isolation --outdir ../dist-cu128-sm70-1.0.0
-popd
-
-export VLLM_VERSION_OVERRIDE="1.0.0"
-python -m build --wheel --no-isolation --outdir dist-cu128-sm70-1.0.0
-```
-
-If you want an editable source install instead of a wheel build:
-
-```bash
-python -m pip install -e . --no-build-isolation
-```
-
-## Public runtime defaults for V100 32 GB reference systems
-
-These are the public `1.0.0` reference configs we recommend writing into
-deployment docs.
+## Public Runtime Defaults
 
 | Host | Model | TP | `max_model_len` | `max_num_seqs` | `max_num_batched_tokens` | Use case |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| 4-card `32 GB` V100 | `Qwen3.5-27B-AWQ` | 4 | `262144` | `1` | `16384` | stable public default |
-| 4-card `32 GB` V100 | `Qwen3.6-27B-AWQ` + MTP | 4 | `262144` | `4` | `8192` | MTP + prefix-cache API serving |
-| 2-card `32 GB` V100 | `Qwen3.6-27B-AWQ` + MTP | 2 | `262144` | `1` | `8192` | memory-constrained MTP serving |
-| 4-card `32 GB` V100 | `Qwen3.6-35B-A3B-AWQ` | 4 | `262144` | `1` | `8192` | stable public default for MoE |
-| 4-card `32 GB` V100 | `Qwen3.5-122B-A10B-AWQ` | 4 | `262144` | `1` | `8096` | long-context large-model default |
+| 4-card 32 GB V100 | `Qwen3.5-27B-AWQ` | 4 | `262144` | `1` | `16384` | stable public default |
+| 4-card 32 GB V100 | `Qwen3.6-27B-AWQ` + MTP | 4 | `262144` | `4` | `8192` | MTP + prefix-cache API serving |
+| 2-card 32 GB V100 | `Qwen3.6-27B-AWQ` + MTP | 2 | `262144` | `1` | `8192` | memory-constrained MTP serving |
+| 4-card 32 GB V100 | `Qwen3.6-35B-A3B-AWQ` | 4 | `262144` | `1` | `8192` | stable public default for MoE |
+| 4-card 32 GB V100 | `Qwen3.5-122B-A10B-AWQ` | 4 | `262144` | `1` | `8096` | long-context large-model default |
 
-Important wording:
+Important defaults:
 
-- `FLASH_ATTN_V100` is the recommended attention backend for V100 in `1.0.0`.
-- Public baseline launch commands in this README default to 256K context
-  (`max_model_len=262144`). If you publish or compare a new baseline, add its
-  exact launch command to this README.
-- Keep `max_num_seqs=1` for the baseline public commands until your workload
-  has been profiled locally. The MTP + prefix-cache profile intentionally uses
-  `max_num_seqs=4`.
-- On V100, Qwen3.6/Qwen3.5 AWQ checkpoints with bundled MTP layers automatically
-  use the public MTP4 server profile unless the related flags are overridden.
-- On 2 x 32 GB V100, keep the 27B MTP profile at `max_num_seqs=1`. The TP4
-  MTP setting `max_num_seqs=4` does not fit in 64 GB at 256K context.
-- On 32 GB V100 with `FLASH_ATTN_V100`, the baseline API
-  server default is also capped at `max_num_seqs=1` to avoid upstream's
-  high-concurrency default preallocating unnecessary KV cache and
-  sampler/CUDAGraph buffers.
+- Public baseline launch commands default to 256K context.
+- Keep `max_num_seqs=1` for baseline public commands until your workload is
+  profiled locally.
+- On V100, Qwen3.6/Qwen3.5 AWQ checkpoints with bundled MTP layers can use the
+  public MTP4 server profile unless the related flags are overridden.
+- On 2 x 32 GB V100, keep the 27B MTP profile at `max_num_seqs=1`.
 - Do not pass `--disable-custom-all-reduce` for the 27B TP4 decode baseline.
-- `122B` uses a small prefill chunk budget to leave room for SM70 MoE
+- `122B` uses a smaller prefill chunk budget to leave room for SM70 MoE
   temporary workspace during long-context serving.
-- `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` is not recommended for the 35B/122B
-  MoE public commands.
 
-## Launch examples
+## Launch Examples
 
-All commands below are written as full runnable commands. When using the
-prebuilt wheels, run them outside the source checkout, for example after
-`cd ~`, so Python loads the installed wheel package and its CUDA extensions.
+All commands below are full runnable commands. When using prebuilt wheels, run
+them outside the source checkout so Python loads the installed package and its
+CUDA extensions.
 
-The commands assume the `1Cat-vLLM` wheel is already installed in your active
-Python environment. Use `CUDA_VISIBLE_DEVICES=0,1,2,3` only when you need to
-select a specific four-card V100 set.
+Use `CUDA_VISIBLE_DEVICES=0,1,2,3` only when you need to select a specific
+four-card V100 set.
 
-### Qwen3.5-27B-AWQ, TP4, public 4-card default
+### Qwen3.5-27B-AWQ, TP4
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
@@ -577,13 +221,10 @@ python -m vllm.entrypoints.openai.api_server \
   --port 8000
 ```
 
-### Qwen3.6-27B-AWQ, TP4, MTP + prefix cache, public 4-card default
+### Qwen3.6-27B-AWQ, TP4, MTP + Prefix Cache
 
-This is the recommended MTP serving profile for the `Qwen3.6-27B-AWQ` model on
-4 x V100 32 GB. It keeps the public 256K context default, enables prefix cache
-for repeated prompts, and defaults to `num_speculative_tokens=4`. MTP8 can be
-faster on stable coding prompts, but MTP4 is the public default because it is
-more balanced on divergent prompts.
+This profile keeps 256K context, enables tool calling, and uses the public MTP
+serving defaults for the Qwen3.6 27B AWQ model family.
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
@@ -597,41 +238,34 @@ python -m vllm.entrypoints.openai.api_server \
   --port 8000
 ```
 
-On V100, 1Cat-vLLM automatically applies the public Qwen3.6 MTP profile for
-this model family:
+On V100, 1Cat-vLLM applies these defaults for this model family:
 
 - MTP4 speculative decoding.
 - 256K context from the model config.
 - `max_num_seqs=4` and `max_num_batched_tokens=8192` for TP4.
 - Prefix cache with `mamba_cache_mode=align`.
 - Text-only multimodal defaults to avoid unnecessary vision cache/profiling.
-- `gpu_memory_utilization=0.88`; KV auto-trim remains enabled unless you
-  explicitly pass `--kv-cache-auto-trim-ratio 0`.
+- `gpu_memory_utilization=0.88`.
 - MTP4 CUDA graph capture sizes used by the validated TP4/TP2 profiles.
 
 If you need a non-default experiment, override the relevant flag explicitly.
-For example, use `--speculative-config '{"method":"mtp","num_speculative_tokens":8}'`
-to benchmark MTP8.
+For example:
+
+```bash
+--speculative-config '{"method":"mtp","num_speculative_tokens":8}'
+```
 
 Do not set `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` for this public MTP profile.
-That dense fast path is experimental and should be benchmarked separately from
-the stable serving command.
+That dense fast path is experimental and should be benchmarked separately.
 
 If decode throughput is much lower than expected, check `/metrics` for the MTP
-acceptance length first. This profile should keep acceptance around 4 on the
-tested coding prompts; falling to about 1.5-2 usually means the prompt is too
+acceptance length first. Very low acceptance usually means the prompt is too
 divergent for speculative decoding or a tuning flag was overridden.
 
-For speed-only experiments without prefix cache or tool calling, use
-`--max-num-seqs 1`, remove `--enable-prefix-caching`,
-`--enable-auto-tool-choice`, and `--tool-call-parser`, and benchmark
-`num_speculative_tokens` in `{2,4,6,8}` locally.
-
-### Qwen3.6-27B-AWQ, TP2, MTP + prefix cache, 2-card 64 GB profile
+### Qwen3.6-27B-AWQ, TP2, MTP + Prefix Cache
 
 Use this profile for two 32 GB V100 cards. It keeps the 256K context limit, but
-uses `max_num_seqs=1` because the TP4 MTP concurrency setting does not fit on
-64 GB.
+uses lower concurrency because the TP4 MTP setting does not fit on 64 GB.
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
@@ -645,11 +279,7 @@ python -m vllm.entrypoints.openai.api_server \
   --port 8000
 ```
 
-The same automatic profile is used, except TP2 defaults to `max_num_seqs=1` and
-`gpu_memory_utilization=0.849`. Do not copy the TP4 `max_num_seqs=4` value into
-this TP2 profile; it does not fit in 64 GB at 256K context.
-
-### Qwen3.6-35B-A3B-AWQ, TP4, public 4-card default
+### Qwen3.6-35B-A3B-AWQ, TP4
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
@@ -665,7 +295,7 @@ python -m vllm.entrypoints.openai.api_server \
   --port 8000
 ```
 
-### Qwen3.5-122B-A10B-AWQ, TP4, long-context 4-card default
+### Qwen3.5-122B-A10B-AWQ, TP4
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
@@ -681,7 +311,7 @@ python -m vllm.entrypoints.openai.api_server \
   --port 8000
 ```
 
-## OpenAI-compatible request example
+## OpenAI-Compatible Request Example
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -696,15 +326,20 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-If the first request returns `2+2 等于 4。`, the service is basically healthy.
+If the response is coherent and short, the API path is basically healthy.
 
-## Optional experimental feature: FP8 KV cache
+## Experimental Features
 
-This is not the default public recommendation, but it is worth documenting.
+### FP8
 
-- `fp8_e4m3` is not usable on V100 in the current Triton path
-- `fp8_e5m2` can be used experimentally
-- do **not** add `--calculate-kv-scales`
+FP8 support is included for validation and research. It is not the stable
+public default.
+
+- FP8 model execution on V100 is experimental.
+- `fp8_e5m2` KV cache can be used experimentally on V100.
+- `fp8_e4m3` is not the recommended V100 option in the current path.
+- Do not add `--calculate-kv-scales` unless you are specifically testing KV
+  scale calculation behavior.
 
 Example:
 
@@ -712,28 +347,99 @@ Example:
 --kv-cache-dtype fp8_e5m2
 ```
 
-## Known limits
+### DFlash
 
-- This branch is optimized for **SM70 / Tesla V100**, not for all hardware.
-- Public launch commands default to 256K context with
-  `max_model_len=262144`.
-- The public 27B command keeps `max_num_batched_tokens=16384`.
-- The public 35B and 122B commands use smaller prefill chunk budgets to leave
-  room for MoE and long-context workspace.
-- Multimodal and vision workloads are not the default public profile for this
-  release.
-- If you want guaranteed headroom for very long prompts, keep
-  `--max-num-seqs 1` before increasing any other knob.
+DFlash is included as an experimental path for continued validation. Treat it
+as a research feature until you have validated speed and output quality on your
+own workload.
 
-## Repository notes
+### Dense F16 Fast Path
 
-- The upstream project is **vLLM**
-- This fork focuses on **SM70 AWQ support and V100-oriented runtime tuning**
-- The public `1.0.0` README prioritizes:
-  - prebuilt wheel installation
-  - short model names in commands
-  - `FLASH_ATTN_V100` as the recommended V100 attention backend
-  - full runnable `python -m vllm.entrypoints.openai.api_server` commands
+`VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` is intended for targeted experiments.
+Keep it disabled for public MoE serving profiles unless you are explicitly
+benchmarking that path.
+
+## Source Build
+
+Source build is supported, but it is **not recommended** for normal runtime
+deployment. Install the release wheels first unless you are changing CUDA,
+C++, or Triton code.
+
+This repository includes the validated `lmdeploy` source tree needed by the
+SM70 AWQ build path.
+
+```bash
+cd /path/to/1Cat-vLLM/vllm
+test -d lmdeploy
+```
+
+Install build dependencies:
+
+```bash
+source /path/to/miniconda3/etc/profile.d/conda.sh
+conda activate 1cat-vllm-sm70
+
+python -m pip install -r requirements/build.txt
+python -m pip install -r requirements/cuda.txt
+python -m pip install -r requirements/common.txt
+python -m pip install cmake build
+```
+
+Build wheels:
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+export TORCH_CUDA_ARCH_LIST="7.0"
+export MAX_JOBS=12
+export NVCC_THREADS=1
+
+rm -rf build vllm.egg-info
+rm -rf .deps/*-build .deps/*-subbuild
+
+pushd flash-attention-v100
+python -m build --wheel --no-isolation --outdir ../dist-cu128-sm70
+popd
+
+python -m build --wheel --no-isolation --outdir dist-cu128-sm70
+```
+
+For editable development:
+
+```bash
+python -m pip install -e . --no-build-isolation
+```
+
+## Benchmarking Notes
+
+- First-request warmup is slow on V100 and should not be included in
+  steady-state throughput.
+- Browser-side OpenAI streaming throughput includes request overhead and should
+  not be compared directly with strict incremental decode TPS.
+- Long-context throughput depends strongly on TP, `max_num_seqs`,
+  `max_num_batched_tokens`, prompt shape, and attention backend.
+- If you publish a baseline, include the full launch command, GPU model,
+  driver, CUDA runtime, model checkpoint, sampling parameters, prompt length,
+  and decode length.
+
+## WeChat Community
+
+**群聊：** 1Cat-vLLM 开源交流群
+
+请使用微信扫描下方二维码加入群组：
+
+![1Cat-vLLM 微信交流群二维码](docs/assets/wechat-group-qr.png)
+
+> 提示：微信群二维码通常 7 天内有效。若扫描失败或提示过期，请重新打开本页查看最新图片，或关注仓库更新。
+
+## Repository Notes
+
+- Upstream project: [vLLM](https://github.com/vllm-project/vllm)
+- This fork focuses on SM70 AWQ support, V100-oriented attention/runtime
+  tuning, and experimental FP8/MTP/DFlash validation paths.
+- Prebuilt wheels are the public installation path.
+- Source builds are for development and kernel work.
 
 ## Acknowledgements
 
